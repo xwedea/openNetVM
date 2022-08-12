@@ -227,7 +227,7 @@ parse_app_args(int argc, char *argv[], const char *progname) {
                                 //         RTE_LOG(INFO, APP, "Option -%c requires an argument.\n", optopt);
 
                                 // error
-                                else if (optopt == 'p')
+                                if (optopt == 'p')
                                         RTE_LOG(INFO, APP, "Option -%c requires an argument.\n", optopt);
                                 else if (isprint(optopt))
                                         RTE_LOG(INFO, APP, "Unknown option `-%c'.\n", optopt);
@@ -275,7 +275,7 @@ parse_app_args(int argc, char *argv[], const char *progname) {
  */
 static int
 parse_backend_json_config(void) {
-        int ret, i, server_count;
+        int ret, i;
         i = 0;
         //server_count=0;
 
@@ -342,7 +342,7 @@ parse_backend_json_config(void) {
                         lb->total_weight += weight->valueint;
                 }
                 config_json = config_json->next;
-                server[i].server_id = i;
+                lb->server[i].server_id = i;
                 i++;
         }
         if ( i != lb->server_count) rte_exit(EXIT_FAILURE, "Invalid list_size in config file\n");
@@ -699,7 +699,7 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta,
                 counter = 0;
         }
         lb->server[flow_info->dest].num_packets++;
-        
+
 
         return 0;
 }
