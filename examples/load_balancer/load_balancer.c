@@ -107,12 +107,19 @@ struct loadbalance {
         /* structures to store server weights */
         int *weights;
         int total_weight;
+
+        /* structure to store number of connections */
+        int *num_connections;
 };
 
 /* Struct for backend servers */
 struct backend_server {
         uint8_t d_addr_bytes[RTE_ETHER_ADDR_LEN];
         uint32_t d_ip;
+        int num_connections;
+        int num_packets;
+        int server_id; // int to keep track of what server struct is for (ex: Server0 would have int server = 0)
+        //num connections and num packets and name from config fiule
 };
 
 /* Struct for flow info */
@@ -121,11 +128,16 @@ struct flow_info {
         uint8_t s_addr_bytes[RTE_ETHER_ADDR_LEN];
         uint64_t last_pkt_cycles;
         int is_active;
+        int num_fin;
 };
 
 struct loadbalance *lb;
 /* number of package between each print */
+//? is this the default value because its so high that if -p never gets used the packets will never print?
 static uint32_t print_delay = 1000000;
+
+/* "boolean" for turing on debug mode */
+static int debug_mode = 0;
 
 /* onvm struct for port info lookup */
 extern struct port_info *ports;
@@ -148,6 +160,7 @@ usage(const char *progname) {
         printf(" - `-t SERVER_PORT` : server port ID\n");
         printf(" - `-f SERVER_CONFIG` : backend server config file\n");
         printf(" - `-p <print_delay>`: number of packets between each print, e.g. `-p 1` prints every packets.\n");
+        printf(" - `-d`: debug info including when connections are recieved and when packets are recieved.\n");
 }
 
 /*
@@ -176,7 +189,7 @@ parse_app_args(int argc, char *argv[], const char *progname) {
         lb->client_port = RTE_MAX_ETHPORTS;
         lb->server_port = RTE_MAX_ETHPORTS;
 
-        while ((c = getopt(argc, argv, "c:r:s:t:f:p:")) != -1) {
+        while ((c = getopt(argc, argv, "c:r:s:t:f:p:d")) != -1) {
                 switch (c) {
                         case 'c':
                                 ret = parse_iface_ip(strdup(optarg), &lb->ip_lb_client);
@@ -204,10 +217,16 @@ parse_app_args(int argc, char *argv[], const char *progname) {
                         case 'p':
                                 print_delay = strtoul(optarg, NULL, 10);
                                 break;
+                        case 'd':
+                                debug_mode = 1;
+                                break;
                         case '?':
                                 usage(progname);
-                                if (optopt == 'd')
-                                        RTE_LOG(INFO, APP, "Option -%c requires an argument.\n", optopt);
+                                //? what is optopt
+                                // if (optopt == 'd')
+                                //         RTE_LOG(INFO, APP, "Option -%c requires an argument.\n", optopt);
+
+                                // error
                                 else if (optopt == 'p')
                                         RTE_LOG(INFO, APP, "Option -%c requires an argument.\n", optopt);
                                 else if (isprint(optopt))
@@ -258,7 +277,7 @@ static int
 parse_backend_json_config(void) {
         int ret, i, server_count;
         i = 0;
-        server_count=0;
+        //server_count=0;
 
         cJSON *config_json = onvm_config_parse_file(lb->cfg_filename);
         cJSON *list_size = NULL;
@@ -282,16 +301,11 @@ parse_backend_json_config(void) {
 
 
         lb->server_count = list_size->valueint;
-        //lb->policy = strdup(policy->valuestring);
 
         if (!strcmp(policy->valuestring, "RROBIN")) lb->policy = RROBIN;
         else if (!strcmp(policy->valuestring, "RANDOM")) lb->policy = RANDOM;
         else if (!strcmp(policy->valuestring, "WEIGHTED_RANDOM")) lb->policy = WEIGHTED_RANDOM;
         else rte_exit(EXIT_FAILURE, "Invalid policy. Check server.json\n");
-
-        // if (!((!strcmp(lb->policy,"random")) || (!strcmp(lb->policy,"rrobin")) || (!strcmp(lb->policy,"weighted_random")))) {
-        //         rte_exit(EXIT_FAILURE, "Invalid policy. Check server.conf\n");
-        // }
         
         lb->weights = (int*)calloc(lb->server_count,sizeof(int));
 
@@ -328,11 +342,10 @@ parse_backend_json_config(void) {
                         lb->total_weight += weight->valueint;
                 }
                 config_json = config_json->next;
+                server[i].server_id = i;
                 i++;
-                server_count++;
-
         }
-        if (server_count!=lb->server_count) rte_exit(EXIT_FAILURE, "Invalid list_size in config file\n");
+        if ( i != lb->server_count) rte_exit(EXIT_FAILURE, "Invalid list_size in config file\n");
         cJSON_Delete(config_json);
 
         printf("\nARP config:\n");
@@ -593,11 +606,14 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta,
         static uint32_t counter = 0;
         struct rte_ipv4_hdr *ip;
         struct rte_ether_hdr *ehdr;
+        struct rte_tcp_hdr* tcp;
         struct flow_info *flow_info;
         int i, ret;
+        uint16_t flags;
 
         ehdr = onvm_pkt_ether_hdr(pkt);
         ip = onvm_pkt_ipv4_hdr(pkt);
+        tcp = onvm_pkt_tcp_hdr(pkt);
 
         /* Ignore packets without ip header, also ignore packets with invalid ip */
         if (ip == NULL || ip->src_addr == 0 || ip->dst_addr == 0) {
@@ -625,14 +641,31 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta,
                 return 0;
         }
 
+        if (tcp != NULL) {
+                flags = ((tcp->data_off << 8) | tcp->tcp_flags) & 0b111111111;
+                // if FIN:
+                if (flags & 0x1) {
+                        flow_info->num_fin = 1;
+                        // remove from flow table
+                        //? where is the pre-existing code to remove fro m hashmap (like a function of something)
+                }
+                
+        } 
+        //??what would be the else here?
+
         /* If the flow entry is new, save the client information */
         if (flow_info->is_active == 0) {
                 flow_info->is_active = 1;
                 for (i = 0; i < RTE_ETHER_ADDR_LEN; i++) {
                         flow_info->s_addr_bytes[i] = ehdr->s_addr.addr_bytes[i];
                 }
+                // since a new connection is being made
+                lb->server[flow_info->dest].num_connections++;
+                if(debug_mode) printf("New connection made with server %d.\n",flow_info->dest);
         }
 
+        //? is this saying if the packet is being sent to server .... else if packet is being sent to client port?
+        // 
         if (pkt->port == lb->server_port) {
                 if (onvm_get_macaddr(lb->client_port, &ehdr->s_addr) == -1) {
                         rte_exit(EXIT_FAILURE, "Failed to obtain MAC address\n");
@@ -665,6 +698,8 @@ packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta,
                 print_flow_info(flow_info);
                 counter = 0;
         }
+        lb->server[flow_info->dest].num_packets++;
+        
 
         return 0;
 }
